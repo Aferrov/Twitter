@@ -7,88 +7,103 @@ from datetime import datetime
 from kafka import KafkaProducer
 from transformers import AutoTokenizer
 
-# 1. CONFIGURACIÓN DEL PRODUCER NATIVO
-producer = KafkaProducer(
+# =====================================================================
+# 1. CONFIGURACION DE KAFKA
+# =====================================================================
+# Inicializar el productor de Kafka configurando la serializacion en JSON
+productor_kafka = KafkaProducer(
     bootstrap_servers=['localhost:9092'],
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
-TOPICO_KAFKA = 'alertas-arequipa'
+topico = 'alertas-arequipa'
 
-# 2. CARGA DEL TOKENIZADOR DE BETO
-MODELO = "dccuchile/bert-base-spanish-wwm-cased"
-tokenizer = AutoTokenizer.from_pretrained(MODELO)
+# =====================================================================
+# 2. CARGA DEL TOKENIZADOR
+# =====================================================================
+# Cargar el tokenizador de BERT para procesar los textos antes de enviarlos
+modelo_nombre = "dccuchile/bert-base-spanish-wwm-cased"
+tokenizador = AutoTokenizer.from_pretrained(modelo_nombre)
 
-# 3. FUNCIÓN DE LIMPIEZA HOMOGÉNEA (Igual a la de train.py)
+# =====================================================================
+# 3. FUNCION DE LIMPIEZA DE TEXTO
+# =====================================================================
 def limpiar_texto(texto):
     if not isinstance(texto, str):
         return ""
-    texto = texto.lower() # Pasa a minúsculas para estandarizar tokens
+    
+    # Pasar a minusculas y remover menciones, enlaces y el caracter hashtag
+    texto = texto.lower()
     texto = re.sub(r'@\w+', '', texto)
     texto = re.sub(r'http\s+|https\S+', '', texto)
     texto = texto.replace('#', '')
+    
+    # Reemplazar tildes y caracteres especiales
     texto = texto.replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u').replace('ñ', 'n')
     texto = re.sub(r'[^\w\s,.:;¡!¿?]', '', texto)
+    
+    # Remover espacios en blanco duplicados
     return " ".join(texto.split())
 
+# =====================================================================
+# 4. EJECUCION PRINCIPAL DEL STREAMING DESDE CSV
+# =====================================================================
 if __name__ == "__main__":
-    print("==================================================")
-    print("📥 Módulo de Ingesta Activo - Streaming desde CSV")
-    print("==================================================\n")
+    print("Iniciando modulo de ingesta desde archivo CSV")
     
-    # Nombre del archivo real que contiene tus tweets de prueba
-    RUTA_CSV = 'dataset_pruebas_expertas.csv'
+    archivo_csv = 'dataset_pruebas_expertas.csv'
     
-    if not os.path.exists(RUTA_CSV):
-        print(f"❌ ERROR CRÍTICO: No se encuentra el archivo '{RUTA_CSV}' en {os.getcwd()}")
+    # Validar la existencia del archivo de datos en el directorio actual
+    if not os.path.exists(archivo_csv):
+        print(f"Error: No se encontro el archivo '{archivo_csv}' en la ruta actual.")
         exit()
         
     try:
-        df = pd.read_csv(RUTA_CSV)
-        df = df.fillna("")
-        print(f"✅ Dataset cargado con éxito. Total de filas a procesar: {len(df)}")
-    except Exception as e:
-        print(f"❌ Error al leer el archivo CSV: {e}")
+        # Leer el archivo de datos y rellenar celdas vacias
+        datos_csv = pd.read_csv(archivo_csv)
+        datos_csv = datos_csv.fillna("")
+        print(f"Archivo cargado correctamente. Filas totales a procesar: {len(datos_csv)}")
+    except Exception as error:
+        print(f"Error al leer el archivo de datos: {error}")
         exit()
         
-    id_secuencial = 0
+    contador_id = 0
     
     try:
-        # CORRECCIÓN: Todo este bucle ahora está correctamente indentado dentro del main
-        for index, fila in df.iterrows():
-            id_secuencial += 1
+        # Recorrer cada fila del archivo de forma secuencial
+        for indice, fila in datos_csv.iterrows():
+            contador_id += 1
             
-            # Extraer textos del CSV mapeando de forma segura las columnas
             texto_original = str(fila['text'])
             texto_limpio = limpiar_texto(texto_original)
             
-            # Si el tuit quedó vacío tras remover enlaces o arrobas, nos lo saltamos
+            # Omitir el registro si el texto queda vacio tras la limpieza
             if not texto_limpio:
                 continue
                 
-            # Tokenizar usando las reglas exactas de BETO (Truncado a 128)
-            tokens = tokenizer(texto_limpio, truncation=True, max_length=128)
+            # Convertir el texto limpio en secuencias de numeros con el tokenizador
+            tokens_procesados = tokenizador(texto_limpio, truncation=True, max_length=128)
             
-            # Construir el diccionario final para el Pipeline
-            datos_pipeline = {
-                "id": id_secuencial,
+            # Estructurar el diccionario con el nuevo formato de estado y prioridad
+            pay_load = {
+                "id": contador_id,
                 "usuario_original": str(fila['user']),
                 "texto": texto_limpio,
                 "timestamp": datetime.now().isoformat(),
-                "emocion_csv": str(fila['emotion']),
-                "sentimiento_csv": str(fila['sentiment']),
-                "input_ids": tokens["input_ids"],
-                "attention_mask": tokens["attention_mask"]
+                "estado_csv": str(fila['estado']),
+                "prioridad_csv": str(fila['prioridad']),
+                "input_ids": tokens_procesados["input_ids"],
+                "attention_mask": tokens_procesados["attention_mask"]
             }
             
-            # Inyectar el payload convertido a bytes en el clúster de Kafka
-            producer.send(TOPICO_KAFKA, value=datos_pipeline)
-            print(f"📥 [ID: {id_secuencial}] Enviado a Kafka -> '{texto_limpio[:50]}...'")
+            # Enviar el registro empaquetado al servidor de Kafka
+            productor_kafka.send(topico, value=pay_load)
+            print(f"Enviado a Kafka - ID: {contador_id} | Texto: {texto_limpio[:45]}...")
             
-            # Retardo de 2 segundos para simular la llegada en tiempo real en tu dashboard/consola
+            # Pausa de 2 segundos para simular la transmision en tiempo real
             time.sleep(2.0)
             
     except KeyboardInterrupt:
-        print("\n🛑 Ingesta por CSV detenida manualmente por el usuario.")
+        print("\nProceso de ingesta detenido por el usuario.")
     finally:
-        print("🔒 Cerrando conexión con el bróker de Kafka...")
-        producer.close()
+        print("Cerrando la conexion con el servidor de Kafka.")
+        productor_kafka.close()

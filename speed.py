@@ -3,143 +3,138 @@ import sys
 import json
 
 # =====================================================================
-# 1. CONFIGURACIÓN ABSOLUTA FORZADA PARA EL ENTORNO EN WINDOWS
+# 1. CONFIGURACION DEL ENTORNO EN WINDOWS
 # =====================================================================
-# Forzamos las rutas reales de tu disco C donde se encuentran tus binarios
-HADOOP_REAL = r"C:\hadoop"
-BIN_REAL = r"C:\hadoop\bin"
+# Definir las rutas locales de la carpeta hadoop para evitar errores de Java
+HADOOP_RUTA = r"C:\hadoop"
+BIN_RUTA = r"C:\hadoop\bin"
 
-os.environ["HADOOP_HOME"] = HADOOP_REAL
-os.environ["hadoop.home.dir"] = HADOOP_REAL
+os.environ["HADOOP_HOME"] = HADOOP_RUTA
+os.environ["hadoop.home.dir"] = HADOOP_RUTA
 
-# Añadimos el directorio bin al PATH del proceso actual para que Java cargue hadoop.dll
-os.environ["PATH"] = BIN_REAL + os.path.pathsep + os.environ.get("PATH", "")
-sys.path.append(BIN_REAL)
+# Agregar los binarios al path del sistema para cargar hadoop.dll
+os.environ["PATH"] = BIN_RUTA + os.path.pathsep + os.environ.get("PATH", "")
+sys.path.append(BIN_RUTA)
 
-# Forzar a los Workers distribuidos a usar exactamente tu mismo ejecutable de Python
+# Asegurar que Spark use el mismo ejecutable de Python
 os.environ['PYSPARK_PYTHON'] = sys.executable
 os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
 
-# OPTIMIZACIÓN EN WINDOWS: Apagar paralelismo redundante de PyTorch en hilos secundarios
+# Desactivar el uso de multiples hilos en PyTorch para evitar conflictos
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-# Importaciones oficiales de PySpark
+# Importar las librerias de PySpark
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, split
+from pyspark.sql.functions import col
 
 # =====================================================================
-# 2. INICIALIZACIÓN DEL MODELO INTELIGENTE (Hilo Principal - Main Thread)
+# 2. CARGA DEL MODELO DE INTELIGENCIA ARTIFICIAL
 # =====================================================================
-print("\n📦 Cargando Arquitectura de Deep Learning y pesos de BETO...")
+print("Cargando modelo y librerias...")
 import torch
 from transformers import AutoModelForSequenceClassification
 
-MODELO_PATH = "./modelo_alertas_arequipa"
-model = AutoModelForSequenceClassification.from_pretrained(MODELO_PATH, num_labels=4)
-model.eval()  # Modo evaluación explícito libre de cálculo de gradientes
+# Cargar los pesos del modelo local
+ruta_modelo = "./modelo_alertas_arequipa"
+modelo = AutoModelForSequenceClassification.from_pretrained(ruta_modelo, num_labels=4)
+modelo.eval()
 
-# Diccionario de mapeo para las predicciones del clasificador
-CATEGORIAS = {0: "Sismo", 1: "Lluvia", 2: "Trafico", 3: "Otros"}
+# Diccionario para convertir el numero de la prediccion en texto
+categorias_mapa = {0: "Sismo", 1: "Lluvia", 2: "Trafico", 3: "Otros"}
 
 # =====================================================================
-# 3. PROCESADOR DE MICRO-LOTES (Arquitectura Híbrida de Baja Latencia)
+# 3. FUNCION PARA PROCESAR CADA LOTE DE DATOS
 # =====================================================================
-def procesar_lote_streaming(df, batch_id):
-    # Recolectar el micro-lote de Spark a memoria local de forma ultra-rápida
-    alertas_locales = df.collect()
+def procesar_lote(datos_spark, lote_id):
+    # Pasar los datos del lote actual a una lista local de Python
+    lista_alertas = datos_spark.collect()
     
-    if len(alertas_locales) == 0:
+    if len(lista_alertas) == 0:
         return
 
-    print(f"\n⚡ [Batch: {batch_id}] - Procesando {len(alertas_locales)} alertas en tiempo real:")
-    print("+" + "-"*5 + "+" + "-"*60 + "+" + "-"*12 + "+" + "-"*12 + "+")
-    print(f"| {'ID':<3} | {'Texto de la Alerta':<58} | {'Estado':<10} | {'Prioridad':<10} |")
-    print("+" + "-"*5 + "+" + "-"*60 + "+" + "-"*12 + "+" + "-"*12 + "+")
+    print(f"Lote: {lote_id} - Procesando {len(lista_alertas)} alertas")
+    print("---------------------------------------------------------------------------------------")
 
-    for fila in alertas_locales:
+    for fila in lista_alertas:
         try:
-            # Deserializar el JSON plano que viene del payload string de Kafka
-            datos_json = json.loads(fila["value"])
+            # Convertir el texto de la fila en un diccionario JSON
+            contenido_json = json.loads(fila["value"])
             
-            id_alerta = datos_json.get("id", 0)
-            texto = datos_json.get("texto", "")
-            input_ids = datos_json.get("input_ids", [])
-            attention_mask = datos_json.get("attention_mask", [])
+            alerta_id = contenido_json.get("id", 0)
+            texto_alerta = contenido_json.get("texto", "")
+            tokens_ids = contenido_json.get("input_ids", [])
+            mascara_atencion = contenido_json.get("attention_mask", [])
             
-            if not input_ids or not attention_mask:
+            if not tokens_ids or not mascara_atencion:
                 continue
 
-            # Conversión limpia y segura a tensores estables de PyTorch de 64 bits (LongTensor)
-            ids_t = torch.tensor([input_ids], dtype=torch.long)
-            mask_t = torch.tensor([attention_mask], dtype=torch.long)
+            # Convertir las listas en tensores para el modelo
+            tensores_ids = torch.tensor([tokens_ids], dtype=torch.long)
+            tensores_mascara = torch.tensor([mascara_atencion], dtype=torch.long)
             
-            # Inferencia directa sobre el hilo actual de Python
+            # Realizar la prediccion con el modelo
             with torch.no_grad():
-                outputs = model(input_ids=ids_t, attention_mask=mask_t)
-                prediccion = torch.argmax(outputs.logits, dim=1).item()
+                resultado = modelo(input_ids=tensores_ids, attention_mask=tensores_mascara)
+                prediccion_id = torch.argmax(resultado.logits, dim=1).item()
                 
-            categoria = CATEGORIAS.get(prediccion, "Otros")
-            texto_min = texto.lower()
+            categoria = categorias_mapa.get(prediccion_id, "Otros")
+            texto_minusculas = texto_alerta.lower()
             
-            # --- Reglas de Negocio: Estado Emocional ---
-            if any(p in texto_min for p in ["ayuda", "auxilio", "socorro", "atrapados", "heridos", "s.o.s", "sos"]):
+            # Determinar el estado segun palabras clave
+            if any(palabra in texto_minusculas for palabra in ["ayuda", "auxilio", "socorro", "atrapados", "heridos", "s.o.s", "sos"]):
                 estado = "Ayuda"
-            elif any(p in texto_min for p in ["pánico", "panico", "miedo", "terror", "desesperante", "rezos", "dios mío", "dios mio"]):
+            elif any(palabra in texto_minusculas for palabra in ["pánico", "panico", "miedo", "terror", "desesperante", "rezos", "dios mío", "dios mio"]):
                 estado = "Pánico"
-            elif any(p in texto_min for p in ["alcalde", "municipio", "incompetentes", "desgracia", "culpable", "brilla por su ausencia"]):
+            elif any(palabra in texto_minusculas for palabra in ["alcalde", "municipio", "incompetentes", "desgracia", "culpable", "brilla por su ausencia"]):
                 estado = "Denuncia"
             else:
                 estado = "Informativo"
                 
-            # --- Reglas de Negocio: Prioridad Operativa ---
-            if any(p in texto_min for p in ["urgente", "ahora", "ya", "inmediato", "morir", "ahogar", "colapso", "destruido"]):
+            # Determinar la prioridad segun palabras clave
+            if any(palabra in texto_minusculas for palabra in ["urgente", "ahora", "ya", "inmediato", "morir", "ahogar", "colapso", "destruido"]):
                 prioridad = "Urgente"
             else:
                 prioridad = "Normal"
             
-            # Truncar visualmente el texto largo para mantener la estética de la consola
-            texto_corto = texto if len(texto) <= 55 else texto[:52] + "..."
-            print(f"| {id_alerta:<3} | {texto_corto:<58} | {estado:<10} | {prioridad:<10} |")
+            print(f"ID: {alerta_id} | Texto: {texto_alerta[:45]}... | Categoria: {categoria} | Estado: {estado} | Prioridad: {prioridad}")
             
-        except Exception as e:
-            print(f"| ERR | Error al procesar alerta individual: {e}")
+        except Exception as error:
+            print(f"Error al procesar registro: {error}")
             
-    print("+" + "-"*5 + "+" + "-"*60 + "+" + "-"*12 + "+" + "-"*12 + "+")
+    print("---------------------------------------------------------------------------------------")
 
 # =====================================================================
-# 4. ORQUESTADOR DE SPARK STRUCTURED STREAMING
+# 4. CONFIGURACION DE SPARK STRUCTURED STREAMING
 # =====================================================================
 if __name__ == "__main__":
-    print("\n==================================================")
-    print("🚀 CAPA SPEED: Spark Structured Streaming Activa")
-    print("==================================================\n")
+    print("Iniciando capa speed con Spark Streaming")
 
-    # Crear la sesión de Spark adjuntando de manera nativa los conectores de Kafka
+    # Crear la sesion de Spark con el paquete de Kafka necesario
     spark = SparkSession.builder \
-        .appName("AlertaArequipa-SpeedLayer-Spark") \
+        .appName("CapaSpeedAlertas") \
         .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
         .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
         .getOrCreate()
 
-    # Silenciar logs ruidosos de la JVM de Java
+    # Ocultar los mensajes de log secundarios de Java
     spark.sparkContext.setLogLevel("WARN")
 
-    # Declarar el flujo de entrada continuo desde Kafka
-    df_kafka = spark.readStream \
+    # Configurar la lectura del flujo de datos desde el servidor de Kafka
+    flujo_kafka = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", "localhost:9092") \
         .option("subscribe", "alertas-arequipa") \
         .option("startingOffsets", "latest") \
         .load()
 
-    # Castear el payload binario ("value") a cadena de texto limpia
-    df_string = df_kafka.select(col("value").cast("string"))
+    # Convertir el valor binario de Kafka en una cadena de texto limpia
+    flujo_texto = flujo_kafka.select(col("value").cast("string"))
 
-    # Despachar las ráfagas continuas de datos mediante el procesador local foreachBatch
-    query = df_string.writeStream \
-        .foreachBatch(procesar_lote_streaming) \
+    # Enviar los datos continuos a la funcion de procesamiento por lotes
+    consulta = flujo_texto.writeStream \
+        .foreachBatch(procesar_lote) \
         .option("checkpointLocation", "./checkpoints_spark_speed") \
         .start()
 
-    query.awaitTermination()
+    consulta.awaitTermination()

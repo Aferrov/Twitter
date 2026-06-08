@@ -1,57 +1,81 @@
 import os
 import pandas as pd
 
-# ── Configuración ──────────────────────────────────────────────────
-ARCHIVO_IN  = "humaid_es.json"
-ARCHIVO_OUT = "dataset_pruebas_expertas.csv"
+# =====================================================================
+# 1. CONFIGURACION DE ARCHIVOS
+# =====================================================================
+archivo_entrada = "humaid_es.json"
+archivo_salida = "dataset_pruebas_expertas.csv"
 
-print("==================================================")
-print("📦 COMPILADOR MASIVO LOCAL (100% OFFLINE)")
-print("==================================================\n")
+print("Iniciando compilador de archivos de texto")
 
 if __name__ == "__main__":
     
-    print(f"[1/2] Buscando archivo local de tweets reales '{ARCHIVO_IN}'...")
+    print(f"Buscando archivo origen local: '{archivo_entrada}'...")
     
-    if not os.path.exists(ARCHIVO_IN):
-        print(f"❌ ERROR CRÍTICO: No se encontró el archivo '{ARCHIVO_IN}' en tu directorio.")
-        print("Por favor, asegúrate de haber corrido completamente el pipeline de traducción primero.")
+    # Validar si el archivo de entrada existe en la carpeta actual
+    if not os.path.exists(archivo_entrada):
+        print(f"Error: No se encontro el archivo '{archivo_entrada}'.")
         exit()
         
     try:
-        # Leer el dataset de tweets reales pre-procesados en español que ya posees
-        df_json = pd.read_json(ARCHIVO_IN)
-        print(f"      ✅ Archivo origen cargado: {len(df_json)} tweets reales detectados.")
+        # Leer el archivo origen con los tweets en espanol
+        datos_json = pd.read_json(archivo_entrada)
+        print(f"Archivo origen cargado con {len(datos_json)} registros.")
         
-        # Mapeamos las columnas al formato exacto que exige tu script ingesta.py
-        df_limpio = pd.DataFrame({
+        # Mapear los datos al nuevo formato de estado y prioridad
+        datos_nuevos = pd.DataFrame({
             "user": "@humaid_real_user",
-            "text": df_json["texto"],  # Tu script de traducción guardó la columna como 'texto'
-            "date": "2026-Crisis",
-            "emotion": "fear",
-            "sentiment": "scared"
+            "text": datos_json["texto"]
         })
         
-        # Limpieza sanitaria local para asegurar que no se envíe basura a Kafka
-        df_limpio = df_limpio.dropna(subset=["text"])
-        df_limpio = df_limpio[df_limpio["text"].astype(str).str.strip() != ""]
-        df_limpio = df_limpio.drop_duplicates(subset=["text"])
+        # Limpieza para quitar registros vacios o duplicados
+        datos_nuevos = datos_nuevos.dropna(subset=["text"])
+        datos_nuevos = datos_nuevos[datos_nuevos["text"].astype(str).str.strip() != ""]
+        datos_nuevos = datos_nuevos.drop_duplicates(subset=["text"])
         
-        # Seleccionamos una porción masiva de 3,000 tweets reales para tu validación cruzada
-        total_filas = min(3000, len(df_limpio))
-        df_final = df_limpio.sample(n=total_filas, random_state=42).reset_index(drop=True)
+        # Seleccionar una muestra maxima de 3000 registros para las pruebas
+        total_registros = min(3000, len(datos_nuevos))
+        datos_muestra = datos_nuevos.sample(n=total_registros, random_state=42).reset_index(drop=True)
         
-        # Reordenar estructuralmente para el bus de Kafka
-        df_final = df_final[["user", "text", "date", "emotion", "sentiment"]]
+        # Crear las columnas de estado y prioridad segun el contenido del texto
+        lista_estados = []
+        lista_prioridades = []
         
-        # Guardar en el disco
-        df_final.to_csv(ARCHIVO_OUT, index=False, encoding="utf-8")
+        for texto in datos_muestra["text"]:
+            texto_minusculas = str(texto).lower()
+            
+            # Asignar estado segun palabras clave
+            if any(p in texto_minusculas for p in ["ayuda", "auxilio", "socorro", "atrapados", "heridos", "s.o.s", "sos"]):
+                estado = "Ayuda"
+            elif any(p in texto_minusculas for p in ["pánico", "panico", "miedo", "terror", "desesperante", "rezos", "dios mío", "dios mio"]):
+                estado = "Pánico"
+            elif any(p in texto_minusculas for p in ["alcalde", "municipio", "incompetentes", "desgracia", "culpable", "brilla por su ausencia"]):
+                estado = "Denuncia"
+            else:
+                estado = "Informativo"
+                
+            # Asignar prioridad segun palabras clave
+            if any(p in texto_minusculas for p in ["urgente", "ahora", "ya", "inmediato", "morir", "ahogar", "colapso", "destruido"]):
+                prioridad = "Urgente"
+            else:
+                prioridad = "Normal"
+                
+            lista_estados.append(estado)
+            lista_prioridades.append(prioridad)
+            
+        # Agregar las nuevas columnas determinadas al conjunto final de datos
+        datos_muestra["estado"] = lista_estados
+        datos_muestra["prioridad"] = lista_prioridades
         
-        print(f"==================================================")
-        print(f"🚀 ¡PROCESO COMPLETADO LOCALMENTE!")
-        print(f"   Archivo masivo creado: '{ARCHIVO_OUT}'")
-        print(f"   Total neto listo para inyectar en Kafka: {len(df_final)} tweets reales.")
-        print(f"==================================================")
+        # Ordenar las columnas para guardarlas en el archivo CSV
+        datos_finales = datos_muestra[["text", "user", "estado", "prioridad"]]
         
-    except Exception as e:
-        print(f"❌ ERROR AL CONSOLIDAR EL DATASET LOCAL: {e}")
+        # Guardar los datos procesados en el disco
+        datos_finales.to_csv(archivo_salida, index=False, encoding="utf-8")
+        
+        print("Proceso completado exitosamente.")
+        print(f"Archivo masivo creado: '{archivo_salida}' con {len(datos_finales)} filas listas.")
+        
+    except Exception as error:
+        print(f"Error al procesar el archivo: {error}")
