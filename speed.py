@@ -1,137 +1,162 @@
 import os
 import sys
 import json
+import torch
 
 # =====================================================================
-# 1. CONFIGURACION DEL ENTORNO EN WINDOWS
+# 1. CONFIGURACION DEL ENTORNO HADOOP Y SPARK
 # =====================================================================
-# Definir las rutas locales de la carpeta hadoop para evitar errores de Java
 HADOOP_RUTA = r"C:\hadoop"
 BIN_RUTA = r"C:\hadoop\bin"
 
 os.environ["HADOOP_HOME"] = HADOOP_RUTA
 os.environ["hadoop.home.dir"] = HADOOP_RUTA
-
-# Agregar los binarios al path del sistema para cargar hadoop.dll
 os.environ["PATH"] = BIN_RUTA + os.path.pathsep + os.environ.get("PATH", "")
 sys.path.append(BIN_RUTA)
 
-# Asegurar que Spark use el mismo ejecutable de Python
 os.environ['PYSPARK_PYTHON'] = sys.executable
 os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
 
-# Desactivar el uso de multiples hilos en PyTorch para evitar conflictos
+# Restringir hilos locales para mitigar la contención de la CPU frente a la Capa Batch
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-# Importar las librerias de PySpark
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col
 
 # =====================================================================
-# 2. CARGA DEL MODELO DE INTELIGENCIA ARTIFICIAL
+# 2. CARGA LOCAL DEL MODELO BETO ABSA CONJUNTO (12 Clases)
 # =====================================================================
-print("Cargando modelo y librerias...")
-import torch
-from transformers import AutoModelForSequenceClassification
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# Cargar los pesos del modelo local
-ruta_modelo = "./modelo_alertas_arequipa"
-modelo = AutoModelForSequenceClassification.from_pretrained(ruta_modelo, num_labels=4)
-modelo.eval()
+# Carga del modelo robusto multidimensional utilizado en la tesis
+ruta_modelo_absa = "./modelo_beto_absa_arequipa"
 
-# Diccionario para convertir el numero de la prediccion en texto
-categorias_mapa = {0: "Sismo", 1: "Lluvia", 2: "Trafico", 3: "Otros"}
+print(f"Inicializando el modelo BETO-ABSA desde '{ruta_modelo_absa}'...")
+tokenizador = AutoTokenizer.from_pretrained(ruta_modelo_absa)
+# CORREGIDO: Se cambia a 12 clases estructurales (4 Aspectos x 3 Sentimientos)
+modelo_absa = AutoModelForSequenceClassification.from_pretrained(ruta_modelo_absa, num_labels=12)
+modelo_absa.eval()
+
+# Taxonomías analíticas de decodificación de la red neuronal
+categorias_desastre = ["Inundación y Lluvias", "Sismos y Derrumbes", "Colapso de Servicios", "Accidentes y Tráfico"]
+escalas_severidad = ["Crítico", "En Riesgo", "Estable"]
 
 # =====================================================================
-# 3. FUNCION PARA PROCESAR CADA LOTE DE DATOS
+# 3. FUNCION PARA PROCESAR CADA LOTE EN STREAMING (INFERENCIA PURE IA)
 # =====================================================================
 def procesar_lote(datos_spark, lote_id):
-    # Pasar los datos del lote actual a una lista local de Python
     lista_alertas = datos_spark.collect()
     
     if len(lista_alertas) == 0:
         return
 
-    print(f"Lote: {lote_id} - Procesando {len(lista_alertas)} alertas")
+    print(f"\n[SPEED] Lote: {lote_id} - Absorbiendo {len(lista_alertas)} alertas desde Kafka")
     print("---------------------------------------------------------------------------------------")
+
+    alertas_procesadas_batch = []
 
     for fila in lista_alertas:
         try:
-            # Convertir el texto de la fila en un diccionario JSON
             contenido_json = json.loads(fila["value"])
-            
             alerta_id = contenido_json.get("id", 0)
             texto_alerta = contenido_json.get("texto", "")
-            tokens_ids = contenido_json.get("input_ids", [])
-            mascara_atencion = contenido_json.get("attention_mask", [])
+            usuario = contenido_json.get("usuario_original", "@anonimo")
+            timestamp = contenido_json.get("timestamp", "")
             
-            if not tokens_ids or not mascara_atencion:
+            if not texto_alerta:
                 continue
 
-            # Convertir las listas en tensores para el modelo
-            tensores_ids = torch.tensor([tokens_ids], dtype=torch.long)
-            tensores_mascara = torch.tensor([mascara_atencion], dtype=torch.long)
+            # Tokenización adaptativa de la secuencia textual
+            tokens_procesados = tokenizador(
+                texto_alerta, 
+                truncation=True, 
+                padding="max_length", 
+                max_length=128, 
+                return_tensors="pt"
+            )
             
-            # Realizar la prediccion con el modelo
+            # Inferencia in-memory protegida contra cálculo de gradientes
             with torch.no_grad():
-                resultado = modelo(input_ids=tensores_ids, attention_mask=tensores_mascara)
+                resultado = modelo_absa(
+                    input_ids=tokens_procesados["input_ids"], 
+                    attention_mask=tokens_procesados["attention_mask"]
+                )
                 prediccion_id = torch.argmax(resultado.logits, dim=1).item()
                 
-            categoria = categorias_mapa.get(prediccion_id, "Otros")
-            texto_minusculas = texto_alerta.lower()
+            # DECODIFICACIÓN MATEMÁTICA ABSA CONJUNTA
+            # La Inteligencia Artificial ahora asume el control analítico total del flujo
+            indice_desastre = prediccion_id // 3   # Dimensión 1: El Aspecto / Tipo de Desastre
+            indice_severidad = prediccion_id % 3  # Dimensión 2: El Sentimiento / Severidad Emocional
             
-            # Determinar el estado segun palabras clave
-            if any(palabra in texto_minusculas for palabra in ["ayuda", "auxilio", "socorro", "atrapados", "heridos", "s.o.s", "sos"]):
-                estado = "Ayuda"
-            elif any(palabra in texto_minusculas for palabra in ["pánico", "panico", "miedo", "terror", "desesperante", "rezos", "dios mío", "dios mio"]):
-                estado = "Pánico"
-            elif any(palabra in texto_minusculas for palabra in ["alcalde", "municipio", "incompetentes", "desgracia", "culpable", "brilla por su ausencia"]):
-                estado = "Denuncia"
-            else:
-                estado = "Informativo"
-                
-            # Determinar la prioridad segun palabras clave
-            if any(palabra in texto_minusculas for palabra in ["urgente", "ahora", "ya", "inmediato", "morir", "ahogar", "colapso", "destruido"]):
-                prioridad = "Urgente"
-            else:
-                prioridad = "Normal"
+            desastre_ia = categorias_desastre[indice_desastre]
+            severidad_ia = escalas_severidad[indice_severidad]
             
-            print(f"ID: {alerta_id} | Texto: {texto_alerta[:45]}... | Categoria: {categoria} | Estado: {estado} | Prioridad: {prioridad}")
+            print(f"ID: {alerta_id:<4} | Aspecto: {desastre_ia:<21} | Sentimiento/Severidad: {severidad_ia:<10} | Texto: {texto_alerta[:35]}...")
+            
+            # Estructurar el documento JSON final para la Serving Layer
+            alerta_documento = {
+                "id": int(alerta_id),
+                "usuario_original": usuario,
+                "texto": texto_alerta,
+                "timestamp": timestamp,
+                "desastre_ia": desastre_ia,
+                "severidad_ia": severidad_ia
+            }
+            alertas_procesadas_batch.append(alerta_documento)
             
         except Exception as error:
-            print(f"Error al procesar registro: {error}")
+            print(f"[ERROR REGISTRO] Falló el cómputo individual: {error}")
             
     print("---------------------------------------------------------------------------------------")
+    
+    # PERSISTENCIA PARALELA EN LA SERVING LAYER (MONGODB)
+    if len(alertas_procesadas_batch) > 0:
+        try:
+            df_mongo = spark.createDataFrame(alertas_procesadas_batch)
+            df_mongo.write \
+                .format("mongodb") \
+                .mode("append") \
+                .option("collection", "alertas_tiempo_real") \
+                .save()
+            print(f"[SPEED] Sincronizadas {len(alertas_procesadas_batch)} alertas en la colección 'alertas_tiempo_real'.")
+        except Exception as e:
+            print(f"[CRÍTICO SPEED] Fallo de persistencia streaming en MongoDB: {e}")
 
 # =====================================================================
-# 4. CONFIGURACION DE SPARK STRUCTURED STREAMING
+# 4. CONFIGURACION DE SPARK STRUCTURED STREAMING (MICRO-BATCHES)
 # =====================================================================
 if __name__ == "__main__":
-    print("Iniciando capa speed con Spark Streaming")
+    print("[SISTEMA] Iniciando Capa Speed con Spark Structured Streaming...")
 
-    # Crear la sesion de Spark con el paquete de Kafka necesario
+    mongo_uri_speed = "mongodb://127.0.0.1:27017/tesis_alertas.alertas_tiempo_real"
+
+    # Inicialización del clúster de Spark Streaming aislando hilos de cómputo (local[2])
     spark = SparkSession.builder \
-        .appName("CapaSpeedAlertas") \
-        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0") \
+        .appName("CapaSpeedABSA") \
+        .master("local[2]") \
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.mongodb.spark:mongo-spark-connector_2.12:10.3.0") \
+        .config("spark.mongodb.write.connection.uri", mongo_uri_speed) \
         .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
+        .config("spark.driver.memory", "2g") \
+        .config("spark.executor.memory", "2g") \
         .getOrCreate()
 
-    # Ocultar los mensajes de log secundarios de Java
     spark.sparkContext.setLogLevel("WARN")
 
-    # Configurar la lectura del flujo de datos desde el servidor de Kafka
+    # Suscripción al bus de mensajería inmutable distribuidor
     flujo_kafka = spark.readStream \
         .format("kafka") \
         .option("kafka.bootstrap.servers", "localhost:9092") \
         .option("subscribe", "alertas-arequipa") \
         .option("startingOffsets", "latest") \
+        .option("failOnDataLoss", "false") \
         .load()
 
-    # Convertir el valor binario de Kafka en una cadena de texto limpia
+    # Des-serialización del flujo binario de Kafka a cadenas de caracteres legibles
     flujo_texto = flujo_kafka.select(col("value").cast("string"))
 
-    # Enviar los datos continuos a la funcion de procesamiento por lotes
+    # Despliegue de la consulta continua por micro-lotes estructurados
     consulta = flujo_texto.writeStream \
         .foreachBatch(procesar_lote) \
         .option("checkpointLocation", "./checkpoints_spark_speed") \

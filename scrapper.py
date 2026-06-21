@@ -1,16 +1,14 @@
+import os
+import re
 import json
 import time
-import re
-import os
 import pandas as pd
 from datetime import datetime
 from kafka import KafkaProducer
-from transformers import AutoTokenizer
 
 # =====================================================================
-# 1. CONFIGURACION DE KAFKA
+# 1. CONFIGURACIÓN DEL BUS DE EVENTOS (KAFKA)
 # =====================================================================
-# Inicializar el productor de Kafka configurando la serializacion en JSON
 productor_kafka = KafkaProducer(
     bootstrap_servers=['localhost:9092'],
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
@@ -18,92 +16,93 @@ productor_kafka = KafkaProducer(
 topico = 'alertas-arequipa'
 
 # =====================================================================
-# 2. CARGA DEL TOKENIZADOR
+# 2. DEFINICIÓN DE RUTAS DEL DATA LAKE
 # =====================================================================
-# Cargar el tokenizador de BERT para procesar los textos antes de enviarlos
-modelo_nombre = "dccuchile/bert-base-spanish-wwm-cased"
-tokenizador = AutoTokenizer.from_pretrained(modelo_nombre)
+RUTA_DATA_LAKE = "./data_lake_historico"
+
+# Asegurar que el directorio del Data Lake exista antes de iniciar la ingesta
+if not os.path.exists(RUTA_DATA_LAKE):
+    os.makedirs(RUTA_DATA_LAKE)
+    print(f"Data Lake creado en: '{RUTA_DATA_LAKE}'")
 
 # =====================================================================
-# 3. FUNCION DE LIMPIEZA DE TEXTO
+# 3. FUNCIÓN DE LIMPIEZA Y NORMALIZACIÓN LÉXICA
 # =====================================================================
 def limpiar_texto(texto):
     if not isinstance(texto, str):
         return ""
     
-    # Pasar a minusculas y remover menciones, enlaces y el caracter hashtag
     texto = texto.lower()
     texto = re.sub(r'@\w+', '', texto)
     texto = re.sub(r'http\s+|https\S+', '', texto)
     texto = texto.replace('#', '')
-    
-    # Reemplazar tildes y caracteres especiales
     texto = texto.replace('á', 'a').replace('é', 'e').replace('í', 'i').replace('ó', 'o').replace('ú', 'u').replace('ñ', 'n')
     texto = re.sub(r'[^\w\s,.:;¡!¿?]', '', texto)
     
-    # Remover espacios en blanco duplicados
     return " ".join(texto.split())
 
 # =====================================================================
-# 4. EJECUCION PRINCIPAL DEL STREAMING DESDE CSV
+# 4. PIPELINE DE INGESTA
 # =====================================================================
 if __name__ == "__main__":
-    print("Iniciando modulo de ingesta desde archivo CSV")
+    print("\nIniciando Módulo de Ingesta")
     
+    # Archivo de pruebas para ingesta
     archivo_csv = 'dataset_pruebas_expertas.csv'
     
-    # Validar la existencia del archivo de datos en el directorio actual
     if not os.path.exists(archivo_csv):
-        print(f"Error: No se encontro el archivo '{archivo_csv}' en la ruta actual.")
+        print(f"No se encontró el archivo '{archivo_csv}' en la ruta actual.")
         exit()
-        
+    
+    # Se carga el archivo
     try:
-        # Leer el archivo de datos y rellenar celdas vacias
         datos_csv = pd.read_csv(archivo_csv)
         datos_csv = datos_csv.fillna("")
-        print(f"Archivo cargado correctamente. Filas totales a procesar: {len(datos_csv)}")
+        print(f"Dataset cargado exitosamente.")
     except Exception as error:
-        print(f"Error al leer el archivo de datos: {error}")
+        print(f"Falló la lectura del archivo CSV: {error}")
         exit()
         
     contador_id = 0
     
+    # Interactuamos linea a linea
     try:
-        # Recorrer cada fila del archivo de forma secuencial
         for indice, fila in datos_csv.iterrows():
             contador_id += 1
             
             texto_original = str(fila['text'])
             texto_limpio = limpiar_texto(texto_original)
             
-            # Omitir el registro si el texto queda vacio tras la limpieza
             if not texto_limpio:
                 continue
                 
-            # Convertir el texto limpio en secuencias de numeros con el tokenizador
-            tokens_procesados = tokenizador(texto_limpio, truncation=True, max_length=128)
-            
-            # Estructurar el diccionario con el nuevo formato de estado y prioridad
-            pay_load = {
+            # Estructuramos la alerta para enviar a las capas
+            alerta = {
                 "id": contador_id,
-                "usuario_original": str(fila['user']),
+                "usuario_original": str(fila['user']) if 'user' in fila else "@ciudadano_aqp",
                 "texto": texto_limpio,
                 "timestamp": datetime.now().isoformat(),
-                "estado_csv": str(fila['estado']),
-                "prioridad_csv": str(fila['prioridad']),
-                "input_ids": tokens_procesados["input_ids"],
-                "attention_mask": tokens_procesados["attention_mask"]
+                "estado": str(fila['estado']) if 'estado' in fila else "Informativo",
+                "prioridad": str(fila['prioridad']) if 'prioridad' in fila else "Normal"
             }
             
-            # Enviar el registro empaquetado al servidor de Kafka
-            productor_kafka.send(topico, value=pay_load)
-            print(f"Enviado a Kafka - ID: {contador_id} | Texto: {texto_limpio[:45]}...")
+            # CAPA SPEED (ENVIADO VÍA KAFKA)
+            productor_kafka.send(topico, value=alerta)
             
-            # Pausa de 2 segundos para simular la transmision en tiempo real
+            # CAPA BATCH (PERSISTENCIA EN DATA LAKE)
+            nombre_archivo_json = f"alerta_{alerta['id']}_{int(time.time())}.json"
+            ruta_final_json = os.path.join(RUTA_DATA_LAKE, nombre_archivo_json)
+            
+            with open(ruta_final_json, 'w', encoding='utf-8') as archivo_json:
+                json.dump(alerta, archivo_json, ensure_ascii=False, indent=4)
+            
+            print(f"ID: {contador_id} -> Enviado | Texto: {texto_limpio[:45]}...")
+            
+            # Pausa de 2.0 segundos para emular la tasa de llegada en producción
             time.sleep(2.0)
             
     except KeyboardInterrupt:
-        print("\nProceso de ingesta detenido por el usuario.")
+        print("\nSimulación interrumpida por el usuario.")
     finally:
-        print("Cerrando la conexion con el servidor de Kafka.")
         productor_kafka.close()
+        print("Sistema cerrado correctamente.")
