@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-06-29T22:34:56.950847",
+  "total_tweets": 122,
+  "tweets_con_drift": 111,
+  "porcentaje_drift": 0.9098,
+  "umbral_configurado": 0.15,
+  "reentrenamiento_recomendado": true,
+  "jergas_detectadas": {
+    "hurricaneflorencia": 5
+  }
+}
